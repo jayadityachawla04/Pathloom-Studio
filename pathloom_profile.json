@@ -1,0 +1,16 @@
+{
+  "name": "Pathloom Studio",
+  "owner": "Jay",
+  "tagline": "Local telemetry, clean trace waterfalls, logs, and service maps in one fast workspace.",
+  "defaultPort": 4318,
+  "focusAreas": [
+    "trace waterfalls",
+    "correlated logs",
+    "service maps",
+    "local-first debugging"
+  ],
+  "notes": [
+    "Protocol behavior stays compatible with OpenTelemetry OTLP exporters.",
+    "Branding, docs, package names, and runtime labels are tuned for Jay's workspace."
+  ]
+}
