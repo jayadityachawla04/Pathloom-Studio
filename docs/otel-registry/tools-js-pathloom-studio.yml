@@ -1,0 +1,25 @@
+title: pathloom-studio
+registryType: utilities
+language: js
+tags:
+  - otel
+  - gui
+  - traces
+  - viewer
+  - otlp
+  - local
+  - development
+  - debugging
+urls:
+  repo: https://github.com/jay/pathloom-studio
+  docs: https://github.com/jay/pathloom-studio#readme
+license: MIT
+description:
+  Lightweight, zero-config OpenTelemetry trace viewer for local development with
+  real-time updates, search, and service map visualization.
+authors:
+  - name: Jay
+    url: https://github.com/jay
+createdAt: 2026-03-15
+isNative: false
+isFirstParty: false
