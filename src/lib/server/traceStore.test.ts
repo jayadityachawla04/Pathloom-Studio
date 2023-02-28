@@ -1,0 +1,504 @@
+import { describe, it, expect, beforeEach } from 'vitest'
+import { traceStore } from '$lib/server/traceStore'
+import { resolveRootServiceName, resolveRootSpanName } from '@pathloom/core'
+import type { StoredTrace } from '$lib/types'
+import simpleTrace from '../../../tests/fixtures/simple-trace.json'
+import simpleLog from '../../../tests/fixtures/simple-log.json'
+import unlinkedLog from '../../../tests/fixtures/log-unlinked.json'
+import multiServiceTrace from '../../../tests/fixtures/multi-service-trace.json'
+import errorTrace from '../../../tests/fixtures/error-trace.json'
+import outOfOrderSpans from '../../../tests/fixtures/out-of-order-spans.json'
+
+beforeEach(() => {
+  traceStore.clearTraces()
+  traceStore.clearLogs()
+})
+
+// ─── ingest + getTraceList ───────────────────────────────────────────────────
+
+describe('traceStore.ingestSpans / getTraceList', () => {
+  it('stores a trace after ingestion', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const list = traceStore.getTraceList()
+    expect(list).toHaveLength(1)
+  })
+
+  it('extracts service name from resource attributes', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const [item] = traceStore.getTraceList()
+    expect(item.serviceName).toBe('frontend')
+    expect(item.allServices).toEqual(['frontend'])
+  })
+
+  it('sets rootSpanName from the root span', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const [item] = traceStore.getTraceList()
+    expect(item.rootSpanName).toBe('GET /')
+  })
+
+  it('computes a positive durationMs', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const [item] = traceStore.getTraceList()
+    expect(item.durationMs).toBeGreaterThan(0)
+  })
+
+  it('sets hasError to false when no error spans', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const [item] = traceStore.getTraceList()
+    expect(item.hasError).toBe(false)
+  })
+
+  it('sets hasError to true when a span has status.code === 2', () => {
+    traceStore.ingestSpans(errorTrace.resourceSpans)
+    const [item] = traceStore.getTraceList()
+    expect(item.hasError).toBe(true)
+  })
+
+  it('normalizes string enum kind ("SPAN_KIND_SERVER") to numeric 2', () => {
+    traceStore.ingestSpans([
+      {
+        resource: {
+          attributes: [{ key: 'service.name', value: { stringValue: 'svc' } }],
+        },
+        scopeSpans: [
+          {
+            scope: {},
+            spans: [
+              {
+                traceId: 'aaaa000000000000000000000000000000000001',
+                spanId: 'bbbb000000000001',
+                parentSpanId: '',
+                name: 'root',
+                kind: 'SPAN_KIND_SERVER',
+                startTimeUnixNano: '1000000000000000000',
+                endTimeUnixNano: '1000000000100000000',
+                attributes: [],
+                events: [],
+                links: [],
+                status: { code: 0, message: '' },
+              },
+            ],
+          },
+        ],
+      },
+    ])
+    const trace = traceStore.getTrace(
+      'aaaa000000000000000000000000000000000001',
+    )!
+    const span = Array.from(trace.spans.values())[0]
+    expect(span.kind).toBe(2)
+  })
+
+  it('normalizes string enum status code ("STATUS_CODE_ERROR") to numeric 2 and sets hasError', () => {
+    traceStore.ingestSpans([
+      {
+        resource: {
+          attributes: [{ key: 'service.name', value: { stringValue: 'svc' } }],
+        },
+        scopeSpans: [
+          {
+            scope: {},
+            spans: [
+              {
+                traceId: 'aaaa000000000000000000000000000000000002',
+                spanId: 'bbbb000000000002',
+                parentSpanId: '',
+                name: 'root',
+                kind: 1,
+                startTimeUnixNano: '1000000000000000000',
+                endTimeUnixNano: '1000000000100000000',
+                attributes: [],
+                events: [],
+                links: [],
+                status: { code: 'STATUS_CODE_ERROR', message: 'boom' },
+              },
+            ],
+          },
+        ],
+      },
+    ])
+    const trace = traceStore.getTrace(
+      'aaaa000000000000000000000000000000000002',
+    )!
+    const span = Array.from(trace.spans.values())[0]
+    expect(span.status.code).toBe(2)
+    const [item] = traceStore.getTraceList()
+    expect(item.hasError).toBe(true)
+  })
+
+  it('counts spans correctly', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const [item] = traceStore.getTraceList()
+    expect(item.spanCount).toBe(1)
+    expect(traceStore.getTraceCount()).toBe(1)
+  })
+
+  it('ignores ingestion of non-array resourceSpans', () => {
+    traceStore.ingestSpans(null as any)
+    expect(traceStore.getTraceList()).toHaveLength(0)
+  })
+
+  it('merges spans from multiple ingestions into the same trace', () => {
+    const batches = outOfOrderSpans as any[]
+    traceStore.ingestSpans(batches[0].resourceSpans) // child first
+    traceStore.ingestSpans(batches[1].resourceSpans) // root second
+    const list = traceStore.getTraceList()
+    // Should be ONE trace, not two
+    expect(list).toHaveLength(1)
+    expect(list[0].spanCount).toBe(2)
+  })
+
+  it('updates rootSpanName when root span arrives late', () => {
+    const batches = outOfOrderSpans as any[]
+    // Ingest only the child batch first
+    traceStore.ingestSpans(batches[0].resourceSpans)
+    let list = traceStore.getTraceList()
+    // No true root yet — stored name might be the child's name or 'unknown'
+    const traceId = list[0].traceId
+
+    // Now ingest the root batch
+    traceStore.ingestSpans(batches[1].resourceSpans)
+    list = traceStore.getTraceList()
+    const item = list.find((t) => t.traceId === traceId)!
+    expect(item.rootSpanName).toBe('GET /api/items')
+  })
+
+  it('handles multi-service traces without merging into one trace', () => {
+    traceStore.ingestSpans(multiServiceTrace.resourceSpans)
+    const list = traceStore.getTraceList()
+    // AAAABBBBCCCCDDDD… is one traceId, all spans belong to it
+    expect(list).toHaveLength(1)
+    expect(list[0].spanCount).toBe(3) // root + 2 backend spans
+    expect(list[0].allServices).toEqual(['backend', 'frontend'])
+  })
+
+  it('resolves serviceName from the root span resource even when another service arrives first', () => {
+    traceStore.ingestSpans([...multiServiceTrace.resourceSpans].reverse())
+    const [item] = traceStore.getTraceList()
+    expect(item.serviceName).toBe('frontend')
+
+    const trace = traceStore.getTrace(item.traceId)!
+    expect(trace.serviceName).toBe('frontend')
+  })
+})
+
+describe('traceStore.ingestLogs', () => {
+  it('ignores ingestion of non-array resourceLogs', () => {
+    traceStore.ingestLogs(null as any)
+    expect(traceStore.getTraceList()).toHaveLength(0)
+  })
+
+  it('correlates logs into an existing trace by traceId', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    traceStore.ingestLogs(simpleLog.resourceLogs)
+
+    const traceId = traceStore.getTraceList()[0].traceId
+    const traceItem = traceStore
+      .getTraceList()
+      .find((item) => item.traceId === traceId)
+    const logs = traceStore.getTraceLogs(traceId)
+
+    expect(logs).toHaveLength(1)
+    expect(traceItem?.logCount).toBe(1)
+
+    const [log] = logs
+    expect(log.traceId).toBe('5B8EFFF798038103D269B633813FC60C')
+    expect(log.spanId).toBe('EEE19B7EC3C1B174')
+    expect(log.body).toBe('database timeout')
+  })
+
+  it('creates a trace shell when logs arrive before spans', () => {
+    traceStore.ingestLogs(simpleLog.resourceLogs)
+    const [traceItem] = traceStore.getTraceList()
+    expect(traceItem).toBeDefined()
+    expect(traceItem.traceId).toBe('5B8EFFF798038103D269B633813FC60C')
+    expect(traceItem.serviceName).toBe('frontend')
+    expect(traceItem.allServices).toEqual(['frontend'])
+    expect(traceItem.logCount).toBe(1)
+  })
+
+  it('sets hasError when log severity is error or above', () => {
+    traceStore.ingestLogs(simpleLog.resourceLogs)
+    const [traceItem] = traceStore.getTraceList()
+    expect(traceItem.hasError).toBe(true)
+  })
+
+  it('ingests uncorrelated logs with null traceId/spanId into global log list', () => {
+    traceStore.ingestLogs(unlinkedLog.resourceLogs)
+
+    const logs = traceStore.getLogList(10)
+    expect(logs).toHaveLength(3)
+    expect(traceStore.getLogCount()).toBe(3)
+    expect(logs.every((log) => log.traceId === null)).toBe(true)
+    expect(logs.every((log) => log.spanId === null)).toBe(true)
+    expect(logs.every((log) => log.serviceName === 'background-worker')).toBe(
+      true,
+    )
+  })
+
+  it('supports deleting selected global logs and clearing all logs', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    traceStore.ingestLogs(unlinkedLog.resourceLogs)
+    traceStore.ingestLogs(simpleLog.resourceLogs)
+
+    const correlatedTraceId = traceStore.getTraceList()[0].traceId
+    expect(
+      traceStore
+        .getTraceList()
+        .find((trace) => trace.traceId === correlatedTraceId)?.logCount,
+    ).toBe(1)
+
+    const initial = traceStore.getLogList(10)
+    expect(initial).toHaveLength(4)
+
+    const deletedCount = traceStore.deleteLogs([initial[0].id])
+    expect(deletedCount).toBe(1)
+    expect(traceStore.getLogList(10)).toHaveLength(3)
+
+    const remainingCorrelated = traceStore
+      .getLogList(10)
+      .find((log) => log.traceId === correlatedTraceId)
+    expect(remainingCorrelated).toBeDefined()
+
+    if (remainingCorrelated) {
+      traceStore.deleteLogs([remainingCorrelated.id])
+    }
+
+    expect(
+      traceStore
+        .getTraceList()
+        .find((trace) => trace.traceId === correlatedTraceId)?.logCount,
+    ).toBe(0)
+
+    traceStore.clearLogs()
+    expect(traceStore.getLogList(10)).toHaveLength(0)
+  })
+
+  it('prefers log.record.uid as the stored log id when present', () => {
+    const payload = JSON.parse(JSON.stringify(simpleLog)) as any
+    payload.resourceLogs[0].scopeLogs[0].logRecords[0].attributes.push({
+      key: 'log.record.uid',
+      value: { stringValue: '01J6WX5W58Y0VZ0A8QK2SJQTR9' },
+    })
+
+    traceStore.ingestLogs(payload.resourceLogs)
+
+    const [log] = traceStore.getLogList(10)
+    expect(log).toBeDefined()
+    expect(log.id).toBe('01J6WX5W58Y0VZ0A8QK2SJQTR9')
+  })
+
+  it('deduplicates logs that share the same log.record.uid', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+
+    const traceId = traceStore.getTraceList()[0].traceId
+    const payload = JSON.parse(JSON.stringify(simpleLog)) as any
+    const base = payload.resourceLogs[0].scopeLogs[0].logRecords[0]
+
+    payload.resourceLogs[0].scopeLogs[0].logRecords = [
+      {
+        ...base,
+        traceId,
+        timeUnixNano: '1544712660500000000',
+        observedTimeUnixNano: '1544712660500000000',
+        attributes: [
+          ...(base.attributes || []),
+          {
+            key: 'log.record.uid',
+            value: { stringValue: '01J6WX5W58Y0VZ0A8QK2SJQTR9' },
+          },
+        ],
+      },
+      {
+        ...base,
+        traceId,
+        body: { stringValue: 'database timeout retry #2' },
+        timeUnixNano: '1544712660600000000',
+        observedTimeUnixNano: '1544712660600000000',
+        attributes: [
+          ...(base.attributes || []),
+          {
+            key: 'log.record.uid',
+            value: { stringValue: '01J6WX5W58Y0VZ0A8QK2SJQTR9' },
+          },
+        ],
+      },
+    ]
+
+    traceStore.ingestLogs(payload.resourceLogs)
+
+    const logs = traceStore.getLogList(10)
+    const traceItem = traceStore
+      .getTraceList()
+      .find((item) => item.traceId === traceId)
+
+    expect(logs).toHaveLength(1)
+    expect(logs[0].id).toBe('01J6WX5W58Y0VZ0A8QK2SJQTR9')
+    expect(logs[0].body).toBe('database timeout retry #2')
+    expect(traceItem?.logCount).toBe(1)
+    expect(traceStore.getLogCount()).toBe(1)
+  })
+})
+
+// ─── getTrace ────────────────────────────────────────────────────────────────
+
+describe('traceStore.getTrace', () => {
+  it('returns undefined for unknown traceId', () => {
+    expect(traceStore.getTrace('nonexistent')).toBeUndefined()
+  })
+
+  it('returns the StoredTrace after ingestion', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const traceId = traceStore.getTraceList()[0].traceId
+    const trace = traceStore.getTrace(traceId)
+    expect(trace).toBeDefined()
+    expect(trace!.traceId).toBe(traceId)
+  })
+
+  it('returns spans as a Map', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const traceId = traceStore.getTraceList()[0].traceId
+    const trace = traceStore.getTrace(traceId)!
+    expect(trace.spans).toBeInstanceOf(Map)
+    expect(trace.spans.size).toBe(1)
+  })
+
+  it('stores flattened attributes on spans', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const traceId = traceStore.getTraceList()[0].traceId
+    const trace = traceStore.getTrace(traceId)!
+    const span = Array.from(trace.spans.values())[0]
+    expect(span.attributes['http.method']).toBe('GET')
+    expect(span.attributes['http.status_code']).toBe(200)
+  })
+})
+
+// ─── FIFO eviction ───────────────────────────────────────────────────────────
+
+describe('traceStore eviction', () => {
+  it('evicts oldest traces when limit exceeded', () => {
+    const limit = traceStore.maxTraces
+    // Insert limit + 1 unique traces
+    for (let i = 0; i < limit + 1; i++) {
+      const traceId = `TRACE${i.toString().padStart(28, '0')}`
+      traceStore.ingestSpans([
+        {
+          resource: {
+            attributes: [
+              { key: 'service.name', value: { stringValue: 'svc' } },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: {},
+              spans: [
+                {
+                  traceId,
+                  spanId: `SPAN${i.toString().padStart(28, '0')}`,
+                  parentSpanId: '',
+                  name: `op-${i}`,
+                  kind: 1,
+                  startTimeUnixNano: `${1_000_000_000 + i}`,
+                  endTimeUnixNano: `${2_000_000_000 + i}`,
+                  attributes: [],
+                  status: { code: 0 },
+                },
+              ],
+            },
+          ],
+        },
+      ])
+    }
+    expect(traceStore.getTraceList(limit + 1)).toHaveLength(limit)
+  })
+})
+
+// ─── resolveRootSpanName ─────────────────────────────────────────────────────
+
+describe('resolveRootSpanName', () => {
+  it('returns the name of the true root span (no parentSpanId)', () => {
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    const traceId = traceStore.getTraceList()[0].traceId
+    const trace = traceStore.getTrace(traceId) as StoredTrace
+    expect(resolveRootSpanName(trace)).toBe('GET /')
+  })
+
+  it('falls back to earliest orphan when no true root exists', () => {
+    // Ingest only the child batch (root span not included)
+    const batches = outOfOrderSpans as any[]
+    traceStore.ingestSpans(batches[0].resourceSpans)
+    const traceId = traceStore.getTraceList()[0].traceId
+    const trace = traceStore.getTrace(traceId) as StoredTrace
+    // The only span is the child, and it becomes the orphan root
+    expect(resolveRootSpanName(trace)).toBe('childOperation')
+  })
+
+  it('returns "unknown" for an empty trace', () => {
+    const emptyTrace: StoredTrace = {
+      traceId: 'empty',
+      rootSpanName: '',
+      serviceName: '',
+      startTimeUnixNano: '0',
+      endTimeUnixNano: '0',
+      updatedAt: 0,
+      spanCount: 0,
+      hasError: false,
+      spans: new Map(),
+    }
+    expect(resolveRootSpanName(emptyTrace)).toBe('unknown')
+  })
+
+  it('returns the root span service name', () => {
+    traceStore.ingestSpans([...multiServiceTrace.resourceSpans].reverse())
+    const traceId = traceStore.getTraceList()[0].traceId
+    const trace = traceStore.getTrace(traceId) as StoredTrace
+    expect(resolveRootServiceName(trace)).toBe('frontend')
+  })
+})
+
+// ─── subscribe / notify ──────────────────────────────────────────────────────
+
+describe('traceStore.subscribe', () => {
+  it('calls listener when spans are ingested', () => {
+    let callCount = 0
+    const unsub = traceStore.subscribe(() => {
+      callCount++
+    })
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    unsub()
+    expect(callCount).toBe(1)
+  })
+
+  it('does not call listener after unsubscribe', () => {
+    let callCount = 0
+    const unsub = traceStore.subscribe(() => {
+      callCount++
+    })
+    unsub()
+    traceStore.ingestSpans(simpleTrace.resourceSpans)
+    expect(callCount).toBe(0)
+  })
+
+  it('calls listener when store is cleared', () => {
+    let callCount = 0
+    const unsub = traceStore.subscribe(() => {
+      callCount++
+    })
+    traceStore.clearTraces()
+    unsub()
+    expect(callCount).toBe(1)
+  })
+})
+
+// ─── maxTraces ───────────────────────────────────────────────────────────────
+
+describe('traceStore.maxTraces', () => {
+  it('returns a positive integer', () => {
+    expect(traceStore.maxTraces).toBeGreaterThan(0)
+    expect(Number.isInteger(traceStore.maxTraces)).toBe(true)
+  })
+
+  it('defaults to 1000 when PATHLOOM_MAX_TRACES is not set', () => {
+    expect(traceStore.maxTraces).toBe(1000)
+  })
+})
