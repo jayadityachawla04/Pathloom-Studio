@@ -1,0 +1,576 @@
+import type {
+  LogListItem,
+  ServiceMapData,
+  StoredLog,
+  StoredSpan,
+  StoredTrace,
+  TraceListItem,
+  TraceStore,
+} from '$lib/types'
+import { buildServiceMap } from '@pathloom/core'
+import { extractAnyValue, flattenAttributes } from '@pathloom/core'
+import { formatTimestamp, getDurationMs } from '$lib/utils/time'
+import { SPAN_KIND_NAMES, STATUS_CODE_NAMES } from '$lib/utils/otlpEnums'
+import {
+  createLogId,
+  resolveRootServiceName,
+  resolveRootSpanName,
+} from '@pathloom/core'
+
+export interface InternalTraceStore extends TraceStore {
+  listAllTraces(): StoredTrace[]
+  replaceAllTraces(traces: StoredTrace[]): void
+}
+
+function isBeforeNano(a: string, b: string): boolean {
+  return BigInt(a) < BigInt(b)
+}
+
+function isAfterNano(a: string, b: string): boolean {
+  return BigInt(a) > BigInt(b)
+}
+
+function normalizeSpanKind(kind: unknown): number {
+  if (typeof kind === 'number') return kind
+  if (typeof kind === 'string' && kind in SPAN_KIND_NAMES)
+    return SPAN_KIND_NAMES[kind]
+  return 0
+}
+
+function normalizeStatusCode(code: unknown): number {
+  if (typeof code === 'number') return code
+  if (typeof code === 'string' && code in STATUS_CODE_NAMES)
+    return STATUS_CODE_NAMES[code]
+  return 0
+}
+
+function getLogTimestamp(logRecord: any): string {
+  return logRecord.timeUnixNano || logRecord.observedTimeUnixNano || ''
+}
+
+export function createInternalTraceStore(
+  maxTraces: number,
+  maxLogs: number,
+): InternalTraceStore {
+  const traces = new Map<string, StoredTrace>()
+  const logs = new Map<string, StoredLog>()
+  const traceLogCounts = new Map<string, number>()
+  const logTraceIdByLogId = new Map<string, string>()
+  const listeners = new Set<() => void>()
+
+  // Monotonic insertion sequence per log, used for incremental SSE delta
+  // streaming (clients pull only logs newer than the last seq they saw).
+  const logSeqById = new Map<string, number>()
+  let logSeq = 0
+  // Bumped whenever logs are explicitly removed (clear/delete) — distinct from
+  // eviction, which clients mirror locally. Signals subscribers to re-snapshot.
+  let logRemovalSeq = 0
+
+  function notifyListeners() {
+    for (const listener of listeners) {
+      listener()
+    }
+  }
+
+  function evictOverflow() {
+    while (traces.size > maxTraces) {
+      const oldestTraceId = traces.keys().next().value
+      if (!oldestTraceId) break
+      traces.delete(oldestTraceId)
+    }
+  }
+
+  function setTraceLogCount(traceId: string) {
+    const trace = traces.get(traceId)
+    if (!trace) return
+    trace.logCount = traceLogCounts.get(traceId) || 0
+  }
+
+  function incrementTraceLogCount(traceId: string) {
+    if (!traceId) return
+    traceLogCounts.set(traceId, (traceLogCounts.get(traceId) || 0) + 1)
+    setTraceLogCount(traceId)
+  }
+
+  function decrementTraceLogCount(traceId: string) {
+    if (!traceId) return
+    const next = (traceLogCounts.get(traceId) || 0) - 1
+    if (next > 0) {
+      traceLogCounts.set(traceId, next)
+    } else {
+      traceLogCounts.delete(traceId)
+    }
+    setTraceLogCount(traceId)
+  }
+
+  function ingestSpans(resourceSpans: any[]): void {
+    if (!resourceSpans || !Array.isArray(resourceSpans)) {
+      return
+    }
+
+    for (const rs of resourceSpans) {
+      const resourceAttrs = flattenAttributes(rs.resource?.attributes)
+      const serviceName = (resourceAttrs['service.name'] as string) || 'unknown'
+
+      const scopeSpansList = rs.scopeSpans || []
+      for (const ss of scopeSpansList) {
+        const scopeName = ss.scope?.name || ''
+        const scopeVersion = ss.scope?.version || ''
+        const scopeAttributes = flattenAttributes(ss.scope?.attributes)
+        const spans = ss.spans || []
+        for (const span of spans) {
+          const traceId = span.traceId
+          if (!traceId) continue
+          const now = Date.now()
+          let trace = traces.get(traceId)
+          if (!trace) {
+            trace = {
+              traceId,
+              rootSpanName: '',
+              serviceName,
+              startTimeUnixNano: span.startTimeUnixNano,
+              endTimeUnixNano: span.endTimeUnixNano,
+              updatedAt: now,
+              spanCount: 0,
+              hasError: false,
+              logCount: traceLogCounts.get(traceId) || 0,
+              spans: new Map(),
+            }
+            traces.set(traceId, trace)
+            evictOverflow()
+          }
+
+          const storedSpan: StoredSpan = {
+            traceId: span.traceId,
+            spanId: span.spanId,
+            parentSpanId: span.parentSpanId || '',
+            name: span.name || '',
+            kind: normalizeSpanKind(span.kind),
+            startTimeUnixNano: span.startTimeUnixNano,
+            endTimeUnixNano: span.endTimeUnixNano,
+            attributes: flattenAttributes(span.attributes),
+            events: (span.events || []).map((e: any) => ({
+              timeUnixNano: e.timeUnixNano,
+              name: e.name || '',
+              attributes: flattenAttributes(e.attributes),
+            })),
+            links: (span.links || []).map((l: any) => ({
+              traceId: l.traceId,
+              spanId: l.spanId,
+              traceState: l.traceState || '',
+              attributes: flattenAttributes(l.attributes),
+            })),
+            status: {
+              code: normalizeStatusCode(span.status?.code),
+              message: span.status?.message || '',
+            },
+            resource: resourceAttrs,
+            scopeName,
+            scopeVersion,
+            scopeAttributes,
+          }
+
+          trace.spans.set(span.spanId, storedSpan)
+          trace.updatedAt = now
+          trace.spanCount = trace.spans.size
+          trace.rootSpanName = resolveRootSpanName(trace)
+
+          const rootServiceName = resolveRootServiceName(trace)
+          if (rootServiceName !== 'unknown') {
+            trace.serviceName = rootServiceName
+          }
+
+          if (isBeforeNano(span.startTimeUnixNano, trace.startTimeUnixNano)) {
+            trace.startTimeUnixNano = span.startTimeUnixNano
+          }
+          if (isAfterNano(span.endTimeUnixNano, trace.endTimeUnixNano)) {
+            trace.endTimeUnixNano = span.endTimeUnixNano
+          }
+
+          if (storedSpan.status.code === 2) {
+            trace.hasError = true
+          }
+
+          if (
+            trace.serviceName === 'unknown' &&
+            rootServiceName === 'unknown' &&
+            serviceName !== 'unknown'
+          ) {
+            trace.serviceName = serviceName
+          }
+        }
+      }
+    }
+
+    notifyListeners()
+  }
+
+  function ingestLogs(resourceLogs: any[]): void {
+    if (!resourceLogs || !Array.isArray(resourceLogs)) {
+      return
+    }
+
+    for (const rl of resourceLogs) {
+      const resourceAttrs = flattenAttributes(rl.resource?.attributes)
+      const serviceName = (resourceAttrs['service.name'] as string) || 'unknown'
+
+      const scopeLogsList = rl.scopeLogs || []
+      for (const sl of scopeLogsList) {
+        const scopeName = sl.scope?.name || ''
+        const scopeVersion = sl.scope?.version || ''
+        const scopeAttributes = flattenAttributes(sl.scope?.attributes)
+        const logRecords = sl.logRecords || []
+
+        for (const [index, logRecord] of logRecords.entries()) {
+          const traceId = logRecord.traceId || ''
+          const now = Date.now()
+          const timestamp = getLogTimestamp(logRecord)
+          if (!timestamp) continue
+
+          const logAttributes = flattenAttributes(logRecord.attributes)
+          const semanticUid = logAttributes['log.record.uid']
+          const hasSemanticUid =
+            typeof semanticUid === 'string' && semanticUid.length > 0
+
+          const storedLog: StoredLog = {
+            traceId,
+            spanId: logRecord.spanId || '',
+            timeUnixNano: logRecord.timeUnixNano || '',
+            observedTimeUnixNano: logRecord.observedTimeUnixNano || '',
+            severityNumber:
+              typeof logRecord.severityNumber === 'number'
+                ? logRecord.severityNumber
+                : Number(logRecord.severityNumber) || 0,
+            severityText: logRecord.severityText || '',
+            body: extractAnyValue(logRecord.body),
+            attributes: logAttributes,
+            resource: resourceAttrs,
+            scopeName,
+            scopeVersion,
+            scopeAttributes,
+          }
+
+          const logId = hasSemanticUid
+            ? semanticUid
+            : createLogId(logRecord, index)
+
+          const previousTraceId = logTraceIdByLogId.get(logId)
+          if (previousTraceId) {
+            decrementTraceLogCount(previousTraceId)
+            logTraceIdByLogId.delete(logId)
+          }
+
+          logs.set(logId, storedLog)
+          logSeqById.set(logId, ++logSeq)
+
+          if (traceId) {
+            logTraceIdByLogId.set(logId, traceId)
+            incrementTraceLogCount(traceId)
+          }
+
+          if (logs.size > maxLogs) {
+            const oldestId = logs.keys().next().value
+            if (oldestId) {
+              logs.delete(oldestId)
+              logSeqById.delete(oldestId)
+              const evictedTraceId = logTraceIdByLogId.get(oldestId)
+              if (evictedTraceId) {
+                decrementTraceLogCount(evictedTraceId)
+                logTraceIdByLogId.delete(oldestId)
+              }
+            }
+          }
+
+          if (!traceId) continue
+
+          // Ensure a trace shell exists and update its metadata
+          let trace = traces.get(traceId)
+          if (!trace) {
+            trace = {
+              traceId,
+              rootSpanName: 'unknown',
+              serviceName,
+              startTimeUnixNano: timestamp,
+              endTimeUnixNano: timestamp,
+              updatedAt: now,
+              spanCount: 0,
+              hasError: false,
+              logCount: traceLogCounts.get(traceId) || 0,
+              spans: new Map(),
+            }
+            traces.set(traceId, trace)
+            evictOverflow()
+          }
+
+          trace.updatedAt = now
+
+          if (isBeforeNano(timestamp, trace.startTimeUnixNano)) {
+            trace.startTimeUnixNano = timestamp
+          }
+          if (isAfterNano(timestamp, trace.endTimeUnixNano)) {
+            trace.endTimeUnixNano = timestamp
+          }
+
+          if (storedLog.severityNumber >= 17) {
+            trace.hasError = true
+          }
+
+          if (trace.serviceName === 'unknown' && serviceName !== 'unknown') {
+            trace.serviceName = serviceName
+          }
+        }
+      }
+    }
+
+    notifyListeners()
+  }
+
+  function resolveTraceServiceName(trace: StoredTrace): string {
+    const root = resolveRootServiceName(trace)
+    return root === 'unknown' ? trace.serviceName : root
+  }
+
+  function resolveTraceAllServices(trace: StoredTrace): string[] {
+    const services = new Set<string>()
+
+    for (const span of trace.spans.values()) {
+      const serviceName = span.resource['service.name']
+      if (typeof serviceName === 'string' && serviceName.length > 0) {
+        services.add(serviceName)
+      }
+    }
+
+    services.add(resolveTraceServiceName(trace))
+
+    return Array.from(services).sort((a, b) => a.localeCompare(b))
+  }
+
+  function toTraceListItem(trace: StoredTrace): TraceListItem {
+    return {
+      serviceName: resolveTraceServiceName(trace),
+      allServices: resolveTraceAllServices(trace),
+      traceId: trace.traceId,
+      rootSpanName: resolveRootSpanName(trace),
+      rootSpanTentative: !Array.from(trace.spans.values()).some(
+        (s) => !s.parentSpanId || s.parentSpanId === '',
+      ),
+      durationMs: getDurationMs(trace.startTimeUnixNano, trace.endTimeUnixNano),
+      spanCount: trace.spanCount,
+      logCount: traceLogCounts.get(trace.traceId) ?? trace.logCount ?? 0,
+      hasError: trace.hasError,
+      startTime: formatTimestamp(trace.startTimeUnixNano),
+      updatedAt: trace.updatedAt,
+    }
+  }
+
+  function compareTracesByStartDesc(a: StoredTrace, b: StoredTrace): number {
+    const aBig = BigInt(a.startTimeUnixNano)
+    const bBig = BigInt(b.startTimeUnixNano)
+    return bBig > aBig ? 1 : bBig < aBig ? -1 : 0
+  }
+
+  function getTraceList(limit = 100): TraceListItem[] {
+    const traceArray = Array.from(traces.values())
+    traceArray.sort(compareTracesByStartDesc)
+    return traceArray.slice(0, limit).map(toTraceListItem)
+  }
+
+  function getTraceCount(): number {
+    return traces.size
+  }
+
+  function getTrace(traceId: string): StoredTrace | undefined {
+    return traces.get(traceId)
+  }
+
+  function getServiceMap(filterTraceId?: string): ServiceMapData {
+    const tracesToProcess = filterTraceId
+      ? ([traces.get(filterTraceId)].filter(Boolean) as StoredTrace[])
+      : Array.from(traces.values())
+    return buildServiceMap(tracesToProcess)
+  }
+
+  function clearTraces(): void {
+    traces.clear()
+    notifyListeners()
+  }
+
+  function deleteTraces(traceIds: string[]): number {
+    if (!Array.isArray(traceIds) || traceIds.length === 0) {
+      return 0
+    }
+
+    let deletedCount = 0
+    for (const traceId of traceIds) {
+      if (traces.delete(traceId)) {
+        deletedCount++
+      }
+    }
+
+    if (deletedCount > 0) {
+      notifyListeners()
+    }
+
+    return deletedCount
+  }
+
+  function toLogListItem(id: string, log: StoredLog): LogListItem {
+    return {
+      id,
+      traceId: log.traceId || null,
+      spanId: log.spanId || null,
+      timeUnixNano: log.timeUnixNano,
+      observedTimeUnixNano: log.observedTimeUnixNano,
+      severityNumber: log.severityNumber,
+      severityText: log.severityText,
+      body: log.body,
+      serviceName: (log.resource['service.name'] as string) || 'unknown',
+    }
+  }
+
+  function compareLogsByTimeDesc(a: StoredLog, b: StoredLog): number {
+    const aTs = BigInt(a.timeUnixNano || a.observedTimeUnixNano || '0')
+    const bTs = BigInt(b.timeUnixNano || b.observedTimeUnixNano || '0')
+    return bTs > aTs ? 1 : bTs < aTs ? -1 : 0
+  }
+
+  function getLogList(limit = 500): LogListItem[] {
+    const all = Array.from(logs.entries())
+
+    all.sort(([, a], [, b]) => compareLogsByTimeDesc(a, b))
+
+    return all.slice(0, limit).map(([id, log]) => toLogListItem(id, log))
+  }
+
+  function getLogCount(): number {
+    return logs.size
+  }
+
+  // Newest sequence number assigned so far. Clients track this as a cursor and
+  // ask getLogsSince() for everything ingested after it.
+  function getMaxLogSeq(): number {
+    return logSeq
+  }
+
+  // Incremented on explicit clear/delete (not eviction); lets SSE subscribers
+  // tell "new logs arrived" (append) apart from "logs removed" (re-snapshot).
+  function getLogRemovalSeq(): number {
+    return logRemovalSeq
+  }
+
+  // Logs ingested after `afterSeq`, newest-first, capped at `limit`. Used to
+  // stream incremental deltas instead of re-sending the whole list.
+  function getLogsSince(afterSeq: number, limit = 5000): LogListItem[] {
+    const fresh: Array<[string, StoredLog]> = []
+    for (const [id, log] of logs) {
+      const seq = logSeqById.get(id)
+      if (seq !== undefined && seq > afterSeq) {
+        fresh.push([id, log])
+      }
+    }
+
+    fresh.sort(([, a], [, b]) => compareLogsByTimeDesc(a, b))
+
+    return fresh.slice(0, limit).map(([id, log]) => toLogListItem(id, log))
+  }
+
+  function getTraceLogs(traceId: string, limit = 100): LogListItem[] {
+    const entries = Array.from(logs.entries()).filter(
+      ([, log]) => log.traceId === traceId,
+    )
+
+    entries.sort(([, a], [, b]) => compareLogsByTimeDesc(a, b))
+
+    return entries.slice(0, limit).map(([id, log]) => toLogListItem(id, log))
+  }
+
+  function getLog(logId: string) {
+    const log = logs.get(logId)
+    if (!log) return undefined
+    return { id: logId, ...log }
+  }
+
+  function clearLogs(): void {
+    logs.clear()
+    logSeqById.clear()
+    logTraceIdByLogId.clear()
+    traceLogCounts.clear()
+    logRemovalSeq++
+    for (const trace of traces.values()) {
+      trace.logCount = 0
+    }
+    notifyListeners()
+  }
+
+  function deleteLogs(logIds: string[]): number {
+    if (!Array.isArray(logIds) || logIds.length === 0) return 0
+
+    let deleted = 0
+    for (const id of logIds) {
+      if (logs.delete(id)) {
+        deleted++
+        logSeqById.delete(id)
+        const traceId = logTraceIdByLogId.get(id)
+        if (traceId) {
+          decrementTraceLogCount(traceId)
+          logTraceIdByLogId.delete(id)
+        }
+      }
+    }
+
+    if (deleted > 0) {
+      logRemovalSeq++
+      notifyListeners()
+    }
+    return deleted
+  }
+
+  function subscribe(fn: () => void): () => void {
+    listeners.add(fn)
+    return () => {
+      listeners.delete(fn)
+    }
+  }
+
+  function listAllTraces(): StoredTrace[] {
+    return Array.from(traces.values())
+  }
+
+  function replaceAllTraces(nextTraces: StoredTrace[]): void {
+    traces.clear()
+    for (const trace of nextTraces) {
+      traces.set(trace.traceId, trace)
+    }
+    evictOverflow()
+    notifyListeners()
+  }
+
+  return {
+    ingestSpans,
+    ingestLogs,
+    getTraceList,
+    getTraceCount,
+    getTrace,
+    getServiceMap,
+    deleteTraces,
+    getLogList,
+    getLogCount,
+    getMaxLogSeq,
+    getLogRemovalSeq,
+    getLogsSince,
+    getTraceLogs,
+    getLog,
+    clearLogs,
+    deleteLogs,
+    clearTraces,
+    subscribe,
+    listAllTraces,
+    replaceAllTraces,
+    get maxTraces() {
+      return maxTraces
+    },
+    get maxLogs() {
+      return maxLogs
+    },
+  }
+}
